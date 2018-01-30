@@ -15,7 +15,8 @@ namespace WebSocketManager
 
         public WebSocket GetSocketById(string id)
         {
-            return _sockets.TryGetValue(id, out WebSocket ret) ? ret : null;
+            //return _sockets.TryGetValue(id, out WebSocket ret) ? ret : null;
+            return _sockets.FirstOrDefault(p => p.Key == id).Value;
         }
 
         public bool SocketExists(string id)
