@@ -13,7 +13,7 @@ namespace WebSocketManager
     public abstract class WebSocketHandler
     {
         protected WebSocketConnectionManager WebSocketConnectionManager { get; set; }
-        private JsonSerializerSettings _jsonSerializerSettings = new JsonSerializerSettings()
+        protected JsonSerializerSettings _jsonSerializerSettings = new JsonSerializerSettings()
         {
             ContractResolver = new CamelCasePropertyNamesContractResolver()
         };
@@ -22,35 +22,58 @@ namespace WebSocketManager
             WebSocketConnectionManager = webSocketConnectionManager;
         }
 
-        public virtual async Task OnConnected(WebSocket socket)
+        public virtual async Task<string> OnConnected(WebSocket socket)
         {
-            WebSocketConnectionManager.AddSocket(socket);
+            string id = WebSocketConnectionManager.AddSocket(socket);
 
             await SendMessageAsync(socket, new Message()
             {
                 MessageType = MessageType.ConnectionEvent,
-                Data = WebSocketConnectionManager.GetId(socket)
+                Data = id
             }).ConfigureAwait(false);
+
+            return id;
         }
 
-        public virtual async Task OnDisconnected(WebSocket socket)
+        public virtual async Task OnDisconnected(WebSocket socket, WebSocketCloseStatus closeStatus = WebSocketCloseStatus.NormalClosure)
         {
-            await WebSocketConnectionManager.RemoveSocket(WebSocketConnectionManager.GetId(socket)).ConfigureAwait(false);
+            string socketId = WebSocketConnectionManager.GetId(socket);
+            if (socketId != null)
+            {
+                await OnDisconnected(socket, socketId, closeStatus).ConfigureAwait(false);
+            }
         }
+
+        public virtual async Task OnDisconnected(WebSocket socket, string socketId, WebSocketCloseStatus closeStatus)
+        {
+            await WebSocketConnectionManager.RemoveSocket(socketId, closeStatus).ConfigureAwait(false);
+        }
+
 
         public async Task SendMessageAsync(WebSocket socket, Message message)
         {
-            if (socket.State != WebSocketState.Open)
+            if (socket == null || socket.State != WebSocketState.Open)
                 return;
 
             var serializedMessage = JsonConvert.SerializeObject(message, _jsonSerializerSettings);
             var encodedMessage = Encoding.UTF8.GetBytes(serializedMessage);
-            await socket.SendAsync(buffer: new ArraySegment<byte>(array: encodedMessage,
-                                                                  offset: 0,
-                                                                  count: encodedMessage.Length),
-                                   messageType: WebSocketMessageType.Text,
-                                   endOfMessage: true,
-                                   cancellationToken: CancellationToken.None).ConfigureAwait(false);
+
+            try
+            {
+                await socket.SendAsync(buffer: new ArraySegment<byte>(array: encodedMessage,
+                                                                 offset: 0,
+                                                                 count: encodedMessage.Length),
+                                  messageType: WebSocketMessageType.Text,
+                                  endOfMessage: true,
+                                  cancellationToken: CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (WebSocketException e)
+            {
+                if (e.WebSocketErrorCode == WebSocketError.ConnectionClosedPrematurely)
+                {
+                    await OnDisconnected(socket, WebSocketCloseStatus.EndpointUnavailable).ConfigureAwait(false);
+                }
+            }
         }
 
         public async Task SendMessageAsync(string socketId, Message message)
@@ -62,8 +85,18 @@ namespace WebSocketManager
         {
             foreach (var pair in WebSocketConnectionManager.GetAll())
             {
-                if (pair.Value.State == WebSocketState.Open)
-                    await SendMessageAsync(pair.Value, message).ConfigureAwait(false);
+                try
+                {
+                    if (pair.Value.State == WebSocketState.Open)
+                        await SendMessageAsync(pair.Value, message).ConfigureAwait(false);
+                }
+                catch (WebSocketException e)
+                {
+                    if (e.WebSocketErrorCode == WebSocketError.ConnectionClosedPrematurely)
+                    {
+                        await OnDisconnected(pair.Value);
+                    }
+                }
             }
         }
 
@@ -86,8 +119,18 @@ namespace WebSocketManager
         {
             foreach (var pair in WebSocketConnectionManager.GetAll())
             {
-                if (pair.Value.State == WebSocketState.Open)
-                    await InvokeClientMethodAsync(pair.Key, methodName, arguments).ConfigureAwait(false);
+                try
+                {
+                    if (pair.Value.State == WebSocketState.Open)
+                        await InvokeClientMethodAsync(pair.Key, methodName, arguments).ConfigureAwait(false);
+                }
+                catch (WebSocketException e)
+                {
+                    if (e.WebSocketErrorCode == WebSocketError.ConnectionClosedPrematurely)
+                    {
+                        await OnDisconnected(pair.Value);
+                    }
+                }
             }
         }
 
@@ -98,6 +141,11 @@ namespace WebSocketManager
             {
                 foreach (var socket in sockets)
                 {
+                    if (!WebSocketConnectionManager.SocketExists(socket))
+                    {
+                        WebSocketConnectionManager.RemoveFromGroup(socket, groupID);
+                        continue;
+                    }
                     await SendMessageAsync(socket, message);
                 }
             }
@@ -110,7 +158,13 @@ namespace WebSocketManager
             {
                 foreach (var id in sockets)
                 {
-                    if(id != except)
+                    if (!WebSocketConnectionManager.SocketExists(id))
+                    {
+                        WebSocketConnectionManager.RemoveFromGroup(id, groupID);
+                        continue;
+                    }
+
+                    if (id != except)
                         await SendMessageAsync(id, message);
                 }
             }
@@ -121,8 +175,14 @@ namespace WebSocketManager
             var sockets = WebSocketConnectionManager.GetAllFromGroup(groupID);
             if (sockets != null)
             {
-                foreach (var id in sockets)
+                foreach (var id in sockets.ToArray())
                 {
+                    if (!WebSocketConnectionManager.SocketExists(id))
+                    {
+                        WebSocketConnectionManager.RemoveFromGroup(id, groupID);
+                        continue;
+                    }
+
                     await InvokeClientMethodAsync(id, methodName, arguments);
                 }
             }
@@ -131,11 +191,17 @@ namespace WebSocketManager
         public async Task InvokeClientMethodToGroupAsync(string groupID, string methodName, string except, params object[] arguments)
         {
             var sockets = WebSocketConnectionManager.GetAllFromGroup(groupID);
-            if(sockets != null)
+            if (sockets != null)
             {
                 foreach (var id in sockets)
                 {
-                    if(id != except)
+                    if (!WebSocketConnectionManager.SocketExists(id))
+                    {
+                        WebSocketConnectionManager.RemoveFromGroup(id, groupID);
+                        continue;
+                    }
+
+                    if (id != except)
                         await InvokeClientMethodAsync(id, methodName, arguments);
                 }
             }
@@ -159,7 +225,11 @@ namespace WebSocketManager
 
             try
             {
-                method.Invoke(this, invocationDescriptor.Arguments);
+                object[] args = new object[invocationDescriptor.Arguments.Length + 1];
+                args[0] = socket;
+                Array.Copy(invocationDescriptor.Arguments, 0, args, 1, invocationDescriptor.Arguments.Length);
+
+                method.Invoke(this, args);
             }
             catch (TargetParameterCountException)
             {
@@ -170,7 +240,7 @@ namespace WebSocketManager
                 }).ConfigureAwait(false);
             }
 
-            catch (ArgumentException)
+            catch (ArgumentException ex)
             {
                 await SendMessageAsync(socket, new Message()
                 {
